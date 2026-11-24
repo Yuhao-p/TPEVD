@@ -1,0 +1,49 @@
+name: Taipei VD collector
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # 每10分鐘（UTC）；GitHub可能延遲數分鐘
+  workflow_dispatch:          # 可在Actions頁面手動執行測試
+
+permissions:
+  contents: write             # 需要建立Release並上傳檔案
+
+concurrency:
+  group: vd-collector
+  cancel-in-progress: false
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      BASE: https://tcgbusfs.blob.core.windows.net/blobtisv
+    steps:
+      - name: Download VD snapshot
+        run: |
+          set -euo pipefail
+          TS=$(TZ=Asia/Taipei date +%Y%m%d_%H%M)
+          DAY=${TS%_*}
+          echo "TS=$TS"   >> "$GITHUB_ENV"
+          echo "DAY=$DAY" >> "$GITHUB_ENV"
+          mkdir -p out
+          curl -fsS --retry 3 --retry-delay 10 --max-time 60 \
+               -o "out/VDDATA_${TS}.xml.gz" "$BASE/GetVDDATA.xml.gz"
+          gzip -t "out/VDDATA_${TS}.xml.gz"     # 確認檔案完整
+          ls -l out
+
+      - name: Create daily release (first run of the day also saves VD locations)
+        run: |
+          set -euo pipefail
+          if ! gh release view "vd-$DAY" >/dev/null 2>&1; then
+            gh release create "vd-$DAY" --title "VD $DAY" \
+               --notes "Taipei City VD raw snapshots (Asia/Taipei date $DAY)"
+            curl -fsS --retry 3 --max-time 60 \
+                 -o "out/VD_static_${DAY}.xml.gz" "$BASE/GetVD.xml.gz" \
+              || echo "::warning::VD static file download failed"
+          fi
+
+      - name: Upload to release
+        run: gh release upload "vd-$DAY" out/* --clobber
