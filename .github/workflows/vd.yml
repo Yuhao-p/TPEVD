@@ -1,16 +1,18 @@
 name: Taipei VD collector
 
-# 每次執行連續抓約5小時45分（每10分鐘一次），結束前自動觸發下一次，形成接力。
-# 每小時的排程只是備援：GitHub排程常漏跑，接力才是主要機制。
-# 要停止收集：到Actions頁面把這個workflow停用（Disable workflow）。
+# 運作方式
+# 1. 每次執行連續抓約5.5小時（每10分鐘一次），在6小時上限前留30分鐘餘裕。
+# 2. 結束時自動觸發下一次執行（接力）；執行未滿30分鐘就結束時不接力，避免出錯時無限重跑。
+# 3. 每小時的排程只是備援，接力中斷時由它重新啟動。
+# 要停止收集：Actions頁面選這個workflow，右上角「...」→ Disable workflow。
 on:
   schedule:
     - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: write   # 允許自動觸發下一次執行
+  contents: write   # 建立Release、上傳檔案
+  actions: write    # 觸發下一次執行
 
 concurrency:
   group: vd-collector
@@ -19,43 +21,64 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 355
+    timeout-minutes: 360
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       BASE: https://tcgbusfs.blob.core.windows.net/blobtisv
-      LOOP_MINUTES: "345"      # 每次執行連續抓多久
-      INTERVAL_SECONDS: "600"  # 每10分鐘一次
+      LOOP_MINUTES: "330"
+      INTERVAL_SECONDS: "600"
+      MIN_BYTES: "10000"
     steps:
+      - name: Record start time
+        run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Collect VD snapshots in a loop
         run: |
           set -uo pipefail
-          END=$(( $(date +%s) + LOOP_MINUTES*60 ))
+          END=$(( JOB_START + LOOP_MINUTES*60 ))
+          fetch() {  # $1=遠端檔名 $2=本機檔名
+            curl -fsS --retry 3 --retry-delay 10 --max-time 60 -o "$2" "$BASE/$1" \
+              && gzip -t "$2" \
+              && [ "$(stat -c %s "$2")" -ge "$MIN_BYTES" ] \
+              || { echo "::warning::$1 failed or too small"; rm -f "$2"; }
+          }
           while [ "$(date +%s)" -lt "$END" ]; do
             START=$(date +%s)
             TS=$(TZ=Asia/Taipei date +%Y%m%d_%H%M)
             DAY=${TS%_*}
             rm -rf out && mkdir -p out
-            # 車道層級資料（每個偵測器、每個車道的5分鐘流量與速度）
-            curl -fsS --retry 3 --retry-delay 10 --max-time 60 \
-                 -o "out/VDDATA_${TS}.xml.gz" "$BASE/GetVDDATA.xml.gz" \
-              && gzip -t "out/VDDATA_${TS}.xml.gz" || { echo "::warning::VDDATA failed $TS"; rm -f out/VDDATA_*; }
-            # 路段層級資料（含路段名稱、起訖座標、總流量）
-            curl -fsS --retry 3 --retry-delay 10 --max-time 60 \
-                 -o "out/VDSECTION_${TS}.xml.gz" "$BASE/GetVD.xml.gz" \
-              && gzip -t "out/VDSECTION_${TS}.xml.gz" || { echo "::warning::VD section failed $TS"; rm -f out/VDSECTION_*; }
+            fetch GetVDDATA.xml.gz "out/VDDATA_${TS}.xml.gz"     # 車道層級
+            fetch GetVD.xml.gz     "out/VDSECTION_${TS}.xml.gz"  # 路段層級
             if ls out/*.gz >/dev/null 2>&1; then
               gh release view "vd-$DAY" >/dev/null 2>&1 || \
                 gh release create "vd-$DAY" --title "VD $DAY" \
                    --notes "Taipei City VD snapshots (Asia/Taipei date $DAY)" || true
-              gh release upload "vd-$DAY" out/*.gz --clobber || echo "::warning::upload failed $TS"
+              for i in 1 2 3; do
+                gh release upload "vd-$DAY" out/*.gz --clobber && break
+                echo "::warning::upload retry $i at $TS"; sleep 15
+              done
               echo "saved $TS"
             fi
-            SLEEP=$(( INTERVAL_SECONDS - ($(date +%s) - START) ))
+            # 睡到下一個10分鐘，但不超過結束時間
+            NOW=$(date +%s)
+            SLEEP=$(( INTERVAL_SECONDS - (NOW - START) ))
+            LEFT=$(( END - NOW ))
+            [ "$SLEEP" -gt "$LEFT" ] && SLEEP=$LEFT
             if [ "$SLEEP" -gt 0 ]; then sleep "$SLEEP"; fi
           done
           exit 0
 
       - name: Chain next run
         if: always()
-        run: gh workflow run vd.yml --ref "${{ github.ref_name }}"
+        run: |
+          ELAPSED=$(( $(date +%s) - JOB_START ))
+          if [ "$ELAPSED" -lt 1800 ]; then
+            echo "::warning::Run lasted only ${ELAPSED}s; not chaining. Hourly schedule will retry."
+            exit 0
+          fi
+          for i in 1 2 3; do
+            gh workflow run vd.yml --ref "${{ github.ref_name }}" && echo "next run dispatched" && exit 0
+            sleep 20
+          done
+          echo "::error::Failed to dispatch next run"; exit 1
