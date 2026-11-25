@@ -3,6 +3,7 @@ name: Taipei VD collector
 # 運作方式
 # 1. 每次執行連續抓約5.5小時（每10分鐘一次），在6小時上限前留30分鐘餘裕。
 # 2. 結束時自動觸發下一次執行（接力）；執行未滿30分鐘就結束時不接力，避免出錯時無限重跑。
+#    所有對GitHub的上傳與指令都有時間上限，單次卡住不會拖垮整個迴圈。
 # 3. 每小時的排程只是備援，接力中斷時由它重新啟動。
 # 要停止收集：Actions頁面選這個workflow，右上角「...」→ Disable workflow。
 on:
@@ -34,6 +35,7 @@ jobs:
         run: echo "JOB_START=$(date +%s)" >> "$GITHUB_ENV"
 
       - name: Collect VD snapshots in a loop
+        timeout-minutes: 340   # 這一步若超時只會讓此步失敗，下一步的接力仍會執行
         run: |
           set -uo pipefail
           END=$(( JOB_START + LOOP_MINUTES*60 ))
@@ -51,12 +53,15 @@ jobs:
             fetch GetVDDATA.xml.gz "out/VDDATA_${TS}.xml.gz"     # 車道層級
             fetch GetVD.xml.gz     "out/VDSECTION_${TS}.xml.gz"  # 路段層級
             if ls out/*.gz >/dev/null 2>&1; then
-              gh release view "vd-$DAY" >/dev/null 2>&1 || \
-                gh release create "vd-$DAY" --title "VD $DAY" \
+              timeout 60 gh release view "vd-$DAY" >/dev/null 2>&1 || \
+                timeout 60 gh release create "vd-$DAY" --title "VD $DAY" \
                    --notes "Taipei City VD snapshots (Asia/Taipei date $DAY)" || true
-              for i in 1 2 3; do
-                gh release upload "vd-$DAY" out/*.gz --clobber && break
-                echo "::warning::upload retry $i at $TS"; sleep 15
+              # 每個檔案分開上傳；單次上傳最多2分鐘，卡住就放棄重來（避免整個迴圈卡死）
+              for f in out/*.gz; do
+                for i in 1 2 3; do
+                  timeout 120 gh release upload "vd-$DAY" "$f" --clobber && break
+                  echo "::warning::upload retry $i for $f"; sleep 10
+                done
               done
               echo "saved $TS"
             fi
@@ -78,7 +83,7 @@ jobs:
             exit 0
           fi
           for i in 1 2 3; do
-            gh workflow run vd.yml --ref "${{ github.ref_name }}" && echo "next run dispatched" && exit 0
+            timeout 60 gh workflow run vd.yml --ref "${{ github.ref_name }}" && echo "next run dispatched" && exit 0
             sleep 20
           done
           echo "::error::Failed to dispatch next run"; exit 1
