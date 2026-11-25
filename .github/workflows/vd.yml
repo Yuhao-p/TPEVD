@@ -1,8 +1,8 @@
 name: Taipei VD collector
 
-# 每小時觸發一次；每次執行會連續抓約5小時50分（每10分鐘一次）。
-# GitHub的排程常會延遲或漏跑，所以改成「長時間連續抓」：
-# 只要有一次觸發成功，就能涵蓋好幾個小時；排隊中的下一次會在前一次結束後接手。
+# 每次執行連續抓約5小時45分（每10分鐘一次），結束前自動觸發下一次，形成接力。
+# 每小時的排程只是備援：GitHub排程常漏跑，接力才是主要機制。
+# 要停止收集：到Actions頁面把這個workflow停用（Disable workflow）。
 on:
   schedule:
     - cron: "17 * * * *"
@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  actions: write   # 允許自動觸發下一次執行
 
 concurrency:
   group: vd-collector
@@ -51,5 +52,10 @@ jobs:
               echo "saved $TS"
             fi
             SLEEP=$(( INTERVAL_SECONDS - ($(date +%s) - START) ))
-            [ "$SLEEP" -gt 0 ] && sleep "$SLEEP"
+            if [ "$SLEEP" -gt 0 ]; then sleep "$SLEEP"; fi
           done
+          exit 0
+
+      - name: Chain next run
+        if: always()
+        run: gh workflow run vd.yml --ref "${{ github.ref_name }}"
