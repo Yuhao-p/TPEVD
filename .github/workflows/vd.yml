@@ -1,12 +1,15 @@
 name: Taipei VD collector
 
+# 每小時觸發一次；每次執行會連續抓約5小時50分（每10分鐘一次）。
+# GitHub的排程常會延遲或漏跑，所以改成「長時間連續抓」：
+# 只要有一次觸發成功，就能涵蓋好幾個小時；排隊中的下一次會在前一次結束後接手。
 on:
   schedule:
-    - cron: "*/10 * * * *"   # 每10分鐘（UTC）；GitHub可能延遲數分鐘
-  workflow_dispatch:          # 可在Actions頁面手動執行測試
+    - cron: "17 * * * *"
+  workflow_dispatch:
 
 permissions:
-  contents: write             # 需要建立Release並上傳檔案
+  contents: write
 
 concurrency:
   group: vd-collector
@@ -15,35 +18,38 @@ concurrency:
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 355
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
       BASE: https://tcgbusfs.blob.core.windows.net/blobtisv
+      LOOP_MINUTES: "345"      # 每次執行連續抓多久
+      INTERVAL_SECONDS: "600"  # 每10分鐘一次
     steps:
-      - name: Download VD snapshot
+      - name: Collect VD snapshots in a loop
         run: |
-          set -euo pipefail
-          TS=$(TZ=Asia/Taipei date +%Y%m%d_%H%M)
-          DAY=${TS%_*}
-          echo "TS=$TS"   >> "$GITHUB_ENV"
-          echo "DAY=$DAY" >> "$GITHUB_ENV"
-          mkdir -p out
-          curl -fsS --retry 3 --retry-delay 10 --max-time 60 \
-               -o "out/VDDATA_${TS}.xml.gz" "$BASE/GetVDDATA.xml.gz"
-          gzip -t "out/VDDATA_${TS}.xml.gz"     # 確認檔案完整
-          ls -l out
-
-      - name: Create daily release (first run of the day also saves VD locations)
-        run: |
-          set -euo pipefail
-          if ! gh release view "vd-$DAY" >/dev/null 2>&1; then
-            gh release create "vd-$DAY" --title "VD $DAY" \
-               --notes "Taipei City VD raw snapshots (Asia/Taipei date $DAY)"
-            curl -fsS --retry 3 --max-time 60 \
-                 -o "out/VD_static_${DAY}.xml.gz" "$BASE/GetVD.xml.gz" \
-              || echo "::warning::VD static file download failed"
-          fi
-
-      - name: Upload to release
-        run: gh release upload "vd-$DAY" out/* --clobber
+          set -uo pipefail
+          END=$(( $(date +%s) + LOOP_MINUTES*60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            START=$(date +%s)
+            TS=$(TZ=Asia/Taipei date +%Y%m%d_%H%M)
+            DAY=${TS%_*}
+            rm -rf out && mkdir -p out
+            # 車道層級資料（每個偵測器、每個車道的5分鐘流量與速度）
+            curl -fsS --retry 3 --retry-delay 10 --max-time 60 \
+                 -o "out/VDDATA_${TS}.xml.gz" "$BASE/GetVDDATA.xml.gz" \
+              && gzip -t "out/VDDATA_${TS}.xml.gz" || { echo "::warning::VDDATA failed $TS"; rm -f out/VDDATA_*; }
+            # 路段層級資料（含路段名稱、起訖座標、總流量）
+            curl -fsS --retry 3 --retry-delay 10 --max-time 60 \
+                 -o "out/VDSECTION_${TS}.xml.gz" "$BASE/GetVD.xml.gz" \
+              && gzip -t "out/VDSECTION_${TS}.xml.gz" || { echo "::warning::VD section failed $TS"; rm -f out/VDSECTION_*; }
+            if ls out/*.gz >/dev/null 2>&1; then
+              gh release view "vd-$DAY" >/dev/null 2>&1 || \
+                gh release create "vd-$DAY" --title "VD $DAY" \
+                   --notes "Taipei City VD snapshots (Asia/Taipei date $DAY)" || true
+              gh release upload "vd-$DAY" out/*.gz --clobber || echo "::warning::upload failed $TS"
+              echo "saved $TS"
+            fi
+            SLEEP=$(( INTERVAL_SECONDS - ($(date +%s) - START) ))
+            [ "$SLEEP" -gt 0 ] && sleep "$SLEEP"
+          done
