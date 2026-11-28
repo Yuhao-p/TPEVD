@@ -1,7 +1,10 @@
 name: Taipei VD collector
 
 # 運作方式
-# 1. 每次執行連續抓約5.5小時（每10分鐘一次），在6小時上限前留30分鐘餘裕。
+# 1. 每次執行連續抓約5.5小時，在6小時上限前留30分鐘餘裕。
+#    VD資料是5分鐘一個統計區間，所以每5分鐘抓一次，並對齊時鐘在每個5分鐘過後2分30秒抓
+#    （xx:02:30、xx:07:30），避開來源檔約在xx:x1、xx:x4至x5更新、檔案暫時404的時刻。
+#    接力換手時新的一次會等到下一個對齊時點才抓，不會重複也不會漏。
 # 2. 結束時自動觸發下一次執行（接力）；執行未滿30分鐘就結束時不接力，避免出錯時無限重跑。
 #    所有對GitHub的上傳與指令都有時間上限，單次卡住不會拖垮整個迴圈。
 # 3. 每小時的排程只是備援，接力中斷時由它重新啟動。
@@ -28,7 +31,8 @@ jobs:
       GH_REPO: ${{ github.repository }}
       BASE: https://tcgbusfs.blob.core.windows.net/blobtisv
       LOOP_MINUTES: "330"
-      INTERVAL_SECONDS: "600"
+      INTERVAL_SECONDS: "300"
+      OFFSET_SECONDS: "150"
       MIN_BYTES: "10000"
     steps:
       - name: Record start time
@@ -40,14 +44,18 @@ jobs:
           set -uo pipefail
           END=$(( JOB_START + LOOP_MINUTES*60 ))
           fetch() {  # $1=遠端檔名 $2=本機檔名
-            curl -fsS --retry 3 --retry-delay 10 --max-time 60 -o "$2" "$BASE/$1" \
+            curl -fsS --retry 4 --retry-all-errors --retry-delay 15 --max-time 60 -o "$2" "$BASE/$1" \
               && gzip -t "$2" \
               && [ "$(stat -c %s "$2")" -ge "$MIN_BYTES" ] \
               || { echo "::warning::$1 failed or too small"; rm -f "$2"; }
           }
-          while [ "$(date +%s)" -lt "$END" ]; do
-            START=$(date +%s)
-            TS=$(TZ=Asia/Taipei date +%Y%m%d_%H%M)
+          # 下一個對齊時點（epoch秒），例如每5分鐘過後150秒
+          next_slot() { local n; n=$(date +%s); echo $(( ((n - OFFSET_SECONDS) / INTERVAL_SECONDS + 1) * INTERVAL_SECONDS + OFFSET_SECONDS )); }
+          while :; do
+            SLOT=$(next_slot)
+            [ "$SLOT" -ge "$END" ] && break
+            sleep $(( SLOT - $(date +%s) ))
+            TS=$(TZ=Asia/Taipei date -d "@$SLOT" +%Y%m%d_%H%M)
             DAY=${TS%_*}
             rm -rf out && mkdir -p out
             fetch GetVDDATA.xml.gz "out/VDDATA_${TS}.xml.gz"     # 車道層級
@@ -65,12 +73,6 @@ jobs:
               done
               echo "saved $TS"
             fi
-            # 睡到下一個10分鐘，但不超過結束時間
-            NOW=$(date +%s)
-            SLEEP=$(( INTERVAL_SECONDS - (NOW - START) ))
-            LEFT=$(( END - NOW ))
-            [ "$SLEEP" -gt "$LEFT" ] && SLEEP=$LEFT
-            if [ "$SLEEP" -gt 0 ]; then sleep "$SLEEP"; fi
           done
           exit 0
 
